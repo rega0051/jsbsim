@@ -34,6 +34,14 @@ HISTORY
 --------------------------------------------------------------------------------
 04/07/2004  DPC  Created
 01/06/2005  DPC  Converted to new XML format
+02/03/2021  CDR  Added option to command as percent RPM rather than percent PowerReq
+                  if MaxRPM != 0 the input command is treated as a normalized RPM command
+                  otherwise it will treat the input command as a normalized Power command
+                Added option to use a first-order lag filter on the measurement feedback
+                  if tau != 0, the first order filter will be used for the RPM
+                  or PowerRequired from the Thruster model
+                If "tau" and "maxrpm" are absent from the XML the algorithm functions as it did before.
+
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 INCLUDES
@@ -61,14 +69,21 @@ FGElectric::FGElectric(FGFDMExec* exec, Element *el, int engine_number, struct F
   Load(exec,el);
 
   Type = etElectric;
-  PowerWatts = 745.7;
-  hptowatts = 745.7;
 
   if (el->FindElement("power"))
-    PowerWatts = el->FindElementValueAsNumberConvertTo("power","WATTS");
+    PowerMax = el->FindElementValueAsNumberConvertTo("power","WATTS");
 
-  string base_property_name = CreateIndexedPropertyName("propulsion/engine",
-                                                        EngineNumber);
+  MaxRPM = 0.0; // If MaxRPM is specified the thottle command will be wrt RPM
+  if (el->FindElement("maxrpm"))
+    MaxRPM = el->FindElementValueAsNumber("maxrpm");
+
+  Tau = 0.0;
+  if (el->FindElement("tau"))
+    Tau = el->FindElementValueAsNumber("tau");
+
+  FiltState = 0.0; // Initialize the filter state
+
+  string base_property_name = CreateIndexedPropertyName("propulsion/engine", EngineNumber);
   exec->GetPropertyManager()->Tie(base_property_name + "/power-hp", &HP);
 
   Debug(0); // Call Debug() routine from constructor if needed
@@ -90,14 +105,63 @@ void FGElectric::Calculate(void)
   if (Thruster->GetType() == FGThruster::ttPropeller) {
     ((FGPropeller*)Thruster)->SetAdvance(in.PropAdvance[EngineNumber]);
     ((FGPropeller*)Thruster)->SetFeather(in.PropFeather[EngineNumber]);
-  } 
+  }
 
-  RPM = Thruster->GetRPM() * Thruster->GetGearRatio();
+  double PowerReq = Thruster->GetPowerRequired(); // [ft-lbs/sec]
 
-  HP = PowerWatts * in.ThrottlePos[EngineNumber] / hptowatts;
-  
+  double PowerMax_ftlbssec = PowerMax * wattstohp * hptoftlbssec;
+  double Cmd = in.ThrottlePos[EngineNumber];
+  double CmdPower;
+  double dt = max(0.0001, in.TotalDeltaT);
+  double alpha;
+
+  if (MaxRPM > 0.0) {
+    double CmdRPM = MaxRPM * Cmd;
+    CmdRPM = min(CmdRPM, MaxRPM);
+
+    double GearRatio = Thruster->GetGearRatio();
+    double RPM = Thruster->GetRPM() * GearRatio;
+    RPM = min(RPM, MaxRPM);
+
+    // First order lag on RPM measure
+    if (Tau > 0.0) {
+      dt = max(0.0001, in.TotalDeltaT);
+      alpha = 1 / (1 + (Tau / dt));
+
+      RPM = alpha*RPM + (1-alpha)*FiltState;
+      FiltState = RPM;
+    }
+
+    // Change in RPM
+    double DeltaRPM = CmdRPM - RPM;
+    // Power Command: DeltaPower = DeltaRPM * TorqueReq
+    double TorqueReq = abs(((FGPropeller*)Thruster)->GetTorque()) / GearRatio;
+    CmdPower = (TorqueReq * (DeltaRPM * rpmtoradpsec) + PowerReq); // [ft-lbs/sec]
+
+  } else {
+    double PowerReqFilt = PowerReq;
+
+    // First order lag on Power measure
+    if (Tau > 0.0) {
+      double PowerReqFilt;
+
+      dt = max(0.0001, in.TotalDeltaT);
+      alpha = 1 / (1 + (Tau / dt));
+
+      PowerReqFilt = alpha*PowerReq + (1-alpha)*FiltState;
+      FiltState = PowerReqFilt;
+
+      CmdPower -= PowerReq;
+    }
+
+    CmdPower = (PowerMax_ftlbssec) * Cmd + PowerReq - PowerReqFilt;
+  }
+
+  CmdPower = min(CmdPower, PowerMax_ftlbssec); // Limit to PowerMax
+
   LoadThrusterInputs();
-  Thruster->Calculate(HP * hptoftlbssec);
+  Thruster->Calculate(CmdPower);
+  HP = CmdPower / hptoftlbssec;
 
   RunPostFunctions();
 }
@@ -161,7 +225,7 @@ void FGElectric::Debug(int from)
     if (from == 0) { // Constructor
 
       cout << "\n    Engine Name: "         << Name << endl;
-      cout << "      Power Watts: "         << PowerWatts << endl;
+      cout << "      Power Max Watts: "         << PowerMax << endl;
 
     }
   }

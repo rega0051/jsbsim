@@ -82,12 +82,14 @@ private:
 
   double CalcFuelNeed(void);
 
-  //double BrakeHorsePower;
-
   // constants
-  double hptowatts;
+  static constexpr double wattstohp = 0.001341022;
+  static constexpr double rpmtoradpsec = 2 * M_PI / 60.0;
 
-  double PowerWatts;         // maximum engine power
+  double MaxRPM;             // Max RPM of motor
+  double FiltState;          // Filter state
+  double Tau;                // Filter time constant
+  double PowerMax;           // maximum engine power
   double RPM;                // revolutions per minute
   double HP;                 // engine output, in horsepower
 
